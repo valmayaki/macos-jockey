@@ -25,12 +25,12 @@
 			<string>jockey</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>jockey</string>
+				<string>mountjockey</string>
 			</array>
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>600258e</string>
+	<string>e539773</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
@@ -38,6 +38,6 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2025, Ben Tindall. All rights reserved.</string>
+	<string>Copyright © 2025 Ben Tindall; modifications © 2026 Valentine Ubani Mayaki.</string>
 </dict>
 </plist>
