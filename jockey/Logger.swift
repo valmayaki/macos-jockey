@@ -46,13 +46,13 @@ final class AppLogger: @unchecked Sendable {
         let sanitized = Self.sanitize(message)
         switch level {
         case .debug:
-            systemLogger.debug("\(sanitized, privacy: .public)")
+            systemLogger.debug("\(sanitized, privacy: .private)")
         case .info:
-            systemLogger.info("\(sanitized, privacy: .public)")
+            systemLogger.info("\(sanitized, privacy: .private)")
         case .warning:
-            systemLogger.warning("\(sanitized, privacy: .public)")
+            systemLogger.warning("\(sanitized, privacy: .private)")
         case .error:
-            systemLogger.error("\(sanitized, privacy: .public)")
+            systemLogger.error("\(sanitized, privacy: .private)")
         }
 
         queue.async {
@@ -63,7 +63,11 @@ final class AppLogger: @unchecked Sendable {
             guard let data = line.data(using: .utf8) else { return }
 
             if !FileManager.default.fileExists(atPath: self.logURL.path) {
-                FileManager.default.createFile(atPath: self.logURL.path, contents: data)
+                FileManager.default.createFile(
+                    atPath: self.logURL.path,
+                    contents: data,
+                    attributes: [.posixPermissions: 0o600]
+                )
                 return
             }
 
@@ -90,6 +94,11 @@ final class AppLogger: @unchecked Sendable {
         let rotated = logURL.appendingPathExtension("1")
         try? FileManager.default.removeItem(at: rotated)
         try? FileManager.default.moveItem(at: logURL, to: rotated)
+        FileManager.default.createFile(
+            atPath: logURL.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        )
     }
 
     private static func sanitize(_ value: String) -> String {

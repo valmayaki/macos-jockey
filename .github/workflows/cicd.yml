@@ -31,7 +31,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: MountJockey
-          path: build/MountJockey.zip
+          path: |
+            build/MountJockey.zip
+            build/MountJockey.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -45,5 +47,7 @@ jobs:
           name: MountJockey
       - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8
         with:
-          files: MountJockey.zip
+          files: |
+            MountJockey.zip
+            MountJockey.dmg
           generate_release_notes: true

@@ -6,6 +6,7 @@ import Network
 enum ShareRuntimeState: Equatable {
     case disabled
     case unmounted
+    case paused
     case waitingForNetwork
     case mounting
     case mounted
@@ -16,6 +17,7 @@ enum ShareRuntimeState: Equatable {
         switch self {
         case .disabled: return "Disabled"
         case .unmounted: return "Unmounted"
+        case .paused: return "Paused"
         case .waitingForNetwork: return "Waiting for network"
         case .mounting: return "Mounting"
         case .mounted: return "Mounted"
@@ -28,6 +30,7 @@ enum ShareRuntimeState: Equatable {
         switch self {
         case .disabled: return "pause.circle"
         case .unmounted: return "externaldrive.badge.minus"
+        case .paused: return "pause.circle.fill"
         case .waitingForNetwork: return "network"
         case .mounting: return "arrow.triangle.2.circlepath"
         case .mounted: return "externaldrive.fill.badge.checkmark"
@@ -45,25 +48,31 @@ final class SMBShareManager: NSObject, ObservableObject {
 
     private let credentialStore: CredentialStoring
     private let endpointChecker: EndpointChecking
-    private let mounter: ShareMounting
+    private let smbfsMounter: ShareMounting
+    private let netfsMounter: ShareMounting
     private let defaults: UserDefaults
     private let saveKey = "mountJockeyShares"
+    private let legacyDefaultMigrationKey = "mountJockeyMigratedLegacyDefaultShare"
+    private let onboardingCompleteKey = "mountJockeyOnboardingComplete"
     private let retryInterval: TimeInterval = 60
     private let reachabilityTimeout: TimeInterval = 120
 
     private var networkMonitor: NWPathMonitor?
     private var retryTimer: Timer?
+    private var scheduledMountAllTask: Task<Void, Never>?
     private var operations: [UUID: Task<Void, Never>] = [:]
 
     init(
         credentialStore: CredentialStoring = KeychainCredentialStore.shared,
         endpointChecker: EndpointChecking = SMBEndpointChecker(),
-        mounter: ShareMounting = NetFSShareMounter(),
+        smbfsMounter: ShareMounting = SmbfsShareMounter(),
+        netfsMounter: ShareMounting = NetFSShareMounter(),
         defaults: UserDefaults = .standard
     ) {
         self.credentialStore = credentialStore
         self.endpointChecker = endpointChecker
-        self.mounter = mounter
+        self.smbfsMounter = smbfsMounter
+        self.netfsMounter = netfsMounter
         self.defaults = defaults
         super.init()
         loadShares()
@@ -75,44 +84,35 @@ final class SMBShareManager: NSObject, ObservableObject {
     deinit {
         networkMonitor?.cancel()
         retryTimer?.invalidate()
+        scheduledMountAllTask?.cancel()
         operations.values.forEach { $0.cancel() }
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     func state(for share: ShareConfiguration) -> ShareRuntimeState {
-        states[share.id] ?? (share.isEnabled ? .unmounted : .disabled)
+        if let state = states[share.id] {
+            return state
+        }
+        if !share.isEnabled {
+            return .disabled
+        }
+        return share.isAutoMountPaused ? .paused : .unmounted
     }
 
     func passwordExists(for share: ShareConfiguration) -> Bool {
-        (try? credentialStore.password(for: share)) != nil
+        (try? credentialStore.containsPassword(for: share)) == true
     }
 
     func saveShare(_ share: ShareConfiguration, password: String?) throws {
-        var updated = shares
-        if let index = updated.firstIndex(where: { $0.id == share.id }) {
-            updated[index] = share
-        } else {
-            updated.append(share)
-        }
-        try ShareConfiguration.validate(updated)
-
-        if let password, !password.isEmpty {
-            try credentialStore.save(password: password, for: share)
-        }
-
-        shares = updated.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        saveShares()
-        states[share.id] = share.isEnabled ? .unmounted : .disabled
-        appendLog("Saved configuration for \(share.name).")
-
-        if share.isEnabled {
-            mount(share)
-        }
+        try persistShare(share, password: password, autoMountIfNeeded: true)
     }
 
-    func removeShare(_ share: ShareConfiguration, removeCredential: Bool = true) {
+    func removeShare(_ share: ShareConfiguration, removeCredential: Bool = false) {
         operations[share.id]?.cancel()
         operations[share.id] = nil
+        if MountTable.current().isMounted(host: share.host, share: share.shareName, at: share.normalizedMountPoint) {
+            try? mounter(for: share).unmount(share)
+        }
         if removeCredential {
             try? credentialStore.deletePassword(for: share)
         }
@@ -122,47 +122,96 @@ final class SMBShareManager: NSObject, ObservableObject {
         appendLog("Removed \(share.name).")
     }
 
+    func forgetPassword(for share: ShareConfiguration) {
+        do {
+            try credentialStore.deletePassword(for: share)
+            appendLog("Forgot password for \(share.name).")
+        } catch {
+            appendLog("Failed forgetting password for \(share.name): \(formattedErrorMessage(error))", level: .error)
+        }
+    }
+
+    func resetSavedConfiguration(removeCredentials: Bool = true) {
+        operations.values.forEach { $0.cancel() }
+        operations.removeAll()
+
+        for share in shares {
+            if MountTable.current().isMounted(host: share.host, share: share.shareName, at: share.normalizedMountPoint) {
+                try? mounter(for: share).unmount(share)
+            }
+            if removeCredentials {
+                try? credentialStore.deletePassword(for: share)
+            }
+        }
+
+        shares = []
+        states.removeAll()
+        defaults.removeObject(forKey: saveKey)
+        defaults.removeObject(forKey: onboardingCompleteKey)
+        defaults.removeObject(forKey: legacyDefaultMigrationKey)
+        appendLog("Reset saved configuration.")
+    }
+
     func setEnabled(_ enabled: Bool, for share: ShareConfiguration) {
         guard var updated = shares.first(where: { $0.id == share.id }) else { return }
         updated.isEnabled = enabled
-        try? saveShare(updated, password: nil)
         if !enabled {
             operations[share.id]?.cancel()
             operations[share.id] = nil
-            states[share.id] = .disabled
         }
+        try? persistShare(updated, password: nil, autoMountIfNeeded: true)
+    }
+
+    func setAutoMountPaused(_ paused: Bool, for share: ShareConfiguration) {
+        guard var updated = shares.first(where: { $0.id == share.id }) else { return }
+        updated.isAutoMountPaused = paused
+        try? persistShare(updated, password: nil, autoMountIfNeeded: !paused)
     }
 
     func mountAll() {
         refreshMountStates()
-        for share in shares where share.isEnabled && state(for: share) != .mounted {
+        for share in shares where share.isEnabled && !share.isAutoMountPaused && state(for: share) != .mounted {
             mount(share)
         }
     }
 
     func mount(_ share: ShareConfiguration) {
-        guard share.isEnabled, operations[share.id] == nil else { return }
+        guard var currentShare = shares.first(where: { $0.id == share.id }) else { return }
+        guard currentShare.isEnabled, operations[currentShare.id] == nil else { return }
+
+        if currentShare.isAutoMountPaused {
+            currentShare.isAutoMountPaused = false
+            do {
+                try persistShare(currentShare, password: nil, autoMountIfNeeded: false)
+            } catch {
+                let message = formattedErrorMessage(error)
+                states[currentShare.id] = .failed(message)
+                appendLog("Failed resuming \(currentShare.name): \(message)", level: .error)
+                return
+            }
+        }
+
         guard !MountTable.current().isMounted(
-            host: share.host,
-            share: share.shareName,
-            at: share.normalizedMountPoint
+            host: currentShare.host,
+            share: currentShare.shareName,
+            at: currentShare.normalizedMountPoint
         ) else {
-            states[share.id] = .mounted
+            states[currentShare.id] = .mounted
             return
         }
 
-        states[share.id] = .waitingForNetwork
-        appendLog("Waiting for SMB endpoint \(share.host):445 for \(share.name).")
+        states[currentShare.id] = .waitingForNetwork
+        appendLog("Waiting for SMB endpoint \(currentShare.host):445 for \(currentShare.name).")
 
-        operations[share.id] = Task { [weak self] in
+        operations[currentShare.id] = Task { [weak self] in
             guard let self else { return }
-            defer { operations[share.id] = nil }
+            defer { operations[currentShare.id] = nil }
 
             let deadline = Date().addingTimeInterval(reachabilityTimeout)
             var reachable = false
             while !Task.isCancelled && Date() < deadline {
                 if await endpointChecker.isReachable(
-                    host: share.host,
+                    host: currentShare.host,
                     port: 445,
                     timeout: 5
                 ) {
@@ -174,46 +223,58 @@ final class SMBShareManager: NSObject, ObservableObject {
 
             guard !Task.isCancelled else { return }
             guard reachable else {
-                states[share.id] = .failed("SMB endpoint did not become reachable within 120 seconds.")
-                appendLog("Timed out waiting for \(share.host):445.", level: .warning)
+                let error = MountJockeyError.mountTimedOut
+                states[currentShare.id] = .failed(error.reportedMessage)
+                appendLog("Timed out waiting for \(currentShare.host):445. \(error.reportedMessage)", level: .warning)
                 return
             }
 
-            states[share.id] = .mounting
-            appendLog("SMB endpoint is reachable; mounting \(share.name).")
+            states[currentShare.id] = .mounting
+            appendLog("SMB endpoint is reachable; mounting \(currentShare.name) (\(mountContext(currentShare))).")
 
             do {
-                guard let password = try credentialStore.password(for: share), !password.isEmpty else {
+                guard let password = try credentialStore.password(for: currentShare), !password.isEmpty else {
                     throw MountJockeyError.credentialMissing
                 }
+                let selectedMounter = mounter(for: currentShare)
                 try await Task.detached(priority: .utility) {
-                    try self.mounter.mount(share, password: password)
+                    try selectedMounter.mount(currentShare, password: password)
                 }.value
-                states[share.id] = .mounted
-                appendLog("Mounted \(share.name) at \(share.normalizedMountPoint).")
+                states[currentShare.id] = .mounted
+                appendLog("Mounted \(currentShare.name) at \(currentShare.normalizedMountPoint).")
             } catch {
-                states[share.id] = .failed(error.localizedDescription)
-                appendLog("Failed mounting \(share.name): \(error.localizedDescription)", level: .error)
+                let message = formattedErrorMessage(error)
+                states[currentShare.id] = .failed(message)
+                appendLog("Failed mounting \(currentShare.name): \(message)", level: .error)
+                if isAuthenticationFailure(error) {
+                    appendLog(
+                        "Authentication rejected for \(mountContext(currentShare)). Check the share name and password, then save again if needed.",
+                        level: .warning
+                    )
+                }
             }
         }
     }
 
     func unmount(_ share: ShareConfiguration) {
         guard operations[share.id] == nil else { return }
+        setAutoMountPaused(true, for: share)
         states[share.id] = .unmounting
         operations[share.id] = Task { [weak self] in
             guard let self else { return }
             defer { operations[share.id] = nil }
 
             do {
+                let selectedMounter = mounter(for: share)
                 try await Task.detached(priority: .utility) {
-                    try self.mounter.unmount(share)
+                    try selectedMounter.unmount(share)
                 }.value
-                states[share.id] = share.isEnabled ? .unmounted : .disabled
+                states[share.id] = share.isEnabled ? .paused : .disabled
                 appendLog("Unmounted \(share.name).")
             } catch {
-                states[share.id] = .failed(error.localizedDescription)
-                appendLog("Failed unmounting \(share.name): \(error.localizedDescription)", level: .error)
+                let message = formattedErrorMessage(error)
+                states[share.id] = .failed(message)
+                appendLog("Failed unmounting \(share.name): \(message)", level: .error)
             }
         }
     }
@@ -226,6 +287,14 @@ final class SMBShareManager: NSObject, ObservableObject {
         NSWorkspace.shared.open(AppLogger.shared.logURL)
     }
 
+    var shouldPresentOnboarding: Bool {
+        shares.isEmpty && defaults.bool(forKey: onboardingCompleteKey) == false
+    }
+
+    func markOnboardingComplete() {
+        defaults.set(true, forKey: onboardingCompleteKey)
+    }
+
     func refreshMountStates() {
         let table = MountTable.current()
         for share in shares {
@@ -236,7 +305,13 @@ final class SMBShareManager: NSObject, ObservableObject {
             ) {
                 states[share.id] = .mounted
             } else if operations[share.id] == nil {
-                states[share.id] = share.isEnabled ? .unmounted : .disabled
+                if !share.isEnabled {
+                    states[share.id] = .disabled
+                } else if share.isAutoMountPaused {
+                    states[share.id] = .paused
+                } else {
+                    states[share.id] = .unmounted
+                }
             }
         }
     }
@@ -247,11 +322,120 @@ final class SMBShareManager: NSObject, ObservableObject {
             let decoded = try? JSONDecoder().decode([ShareConfiguration].self, from: data),
             (try? ShareConfiguration.validate(decoded)) != nil
         else {
-            shares = [.defaultShare()]
+            shares = []
             saveShares()
             return
         }
+
+        let migratedShares = decoded.filter { !ShareConfiguration.isLegacyDefaultShare($0) }
+        if migratedShares.count != decoded.count {
+            shares = migratedShares
+            defaults.set(true, forKey: legacyDefaultMigrationKey)
+            saveShares()
+            appendLog("Removed legacy default NAS configuration; add your own SMB share in Preferences.")
+            return
+        }
+
         shares = decoded
+    }
+
+    private func persistShare(
+        _ share: ShareConfiguration,
+        password: String?,
+        autoMountIfNeeded: Bool
+    ) throws {
+        let previousShare = shares.first(where: { $0.id == share.id })
+        let savedShares = try sortedShares(replacing: share)
+        let shouldReplaceMountedShare = previousShare?.mountedShareSignature != share.mountedShareSignature
+            && previousShare.map {
+                MountTable.current().isMounted(
+                    host: $0.host,
+                    share: $0.shareName,
+                    at: $0.normalizedMountPoint
+                )
+            } == true
+
+        if let password, !password.isEmpty {
+            try credentialStore.save(password: password, for: share)
+        }
+
+        if let previousShare, previousShare.mountSignature != share.mountSignature {
+            operations[previousShare.id]?.cancel()
+            operations[previousShare.id] = nil
+        }
+
+        shares = savedShares
+        saveShares()
+        if MountTable.current().isMounted(
+            host: share.host,
+            share: share.shareName,
+            at: share.normalizedMountPoint
+        ) {
+            states[share.id] = .mounted
+        } else {
+            states[share.id] = share.isEnabled ? (share.isAutoMountPaused ? .paused : .unmounted) : .disabled
+        }
+        appendLog("Saved configuration for \(share.name).")
+
+        if let previousShare, shouldReplaceMountedShare {
+            scheduleConfigurationReplacement(previousShare, with: share)
+            return
+        }
+
+        if autoMountIfNeeded, share.isEnabled, !share.isAutoMountPaused {
+            mount(share)
+        }
+    }
+
+    private func scheduleConfigurationReplacement(
+        _ previousShare: ShareConfiguration,
+        with updatedShare: ShareConfiguration
+    ) {
+        states[updatedShare.id] = .unmounting
+        appendLog("Configuration changed for mounted share \(updatedShare.name); replacing previous mount asynchronously.")
+        Task { [weak self] in
+            do {
+                let selectedMounter = await self?.mounter(for: previousShare)
+                try await Task.detached(priority: .utility) {
+                    try selectedMounter?.unmount(previousShare)
+                }.value
+                await MainActor.run {
+                    self?.states[updatedShare.id] = .unmounted
+                    if updatedShare.isEnabled, !updatedShare.isAutoMountPaused {
+                        self?.mount(updatedShare)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    let message = self?.formattedErrorMessage(error) ?? error.localizedDescription
+                    self?.states[updatedShare.id] = .failed(message)
+                    self?.appendLog(
+                        "Failed replacing previous configuration for \(updatedShare.name): \(message)",
+                        level: .error
+                    )
+                }
+            }
+        }
+    }
+
+    private func mounter(for share: ShareConfiguration) -> ShareMounting {
+        switch share.mountMethod {
+        case .smbfs:
+            return smbfsMounter
+        case .netfs:
+            return netfsMounter
+        }
+    }
+
+    private func sortedShares(replacing share: ShareConfiguration) throws -> [ShareConfiguration] {
+        var updated = shares
+        if let index = updated.firstIndex(where: { $0.id == share.id }) {
+            updated[index] = share
+        } else {
+            updated.append(share)
+        }
+        try ShareConfiguration.validate(updated)
+        return updated.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     private func saveShares() {
@@ -259,13 +443,28 @@ final class SMBShareManager: NSObject, ObservableObject {
         defaults.set(data, forKey: saveKey)
     }
 
+    private func formattedErrorMessage(_ error: Error) -> String {
+        if let mountError = error as? MountJockeyError {
+            return mountError.reportedMessage
+        }
+        return "[SMB_UNKNOWN_ERROR] \(error.localizedDescription)"
+    }
+
+    private func mountContext(_ share: ShareConfiguration) -> String {
+        "\(share.username)@\(share.host)/\(share.shareName) -> \(share.normalizedMountPoint)"
+    }
+
+    private func isAuthenticationFailure(_ error: Error) -> Bool {
+        guard case let MountJockeyError.mountFailed(status) = error else { return false }
+        return status == Int32(EPERM) || status == Int32(EACCES)
+    }
+
     private func startMonitoring() {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard path.status == .satisfied else { return }
             Task { @MainActor in
-                self?.appendLog("Network path changed; checking configured shares.")
-                self?.mountAll()
+                self?.scheduleMountAll(reason: "Network path changed", delay: 5)
             }
         }
         monitor.start(queue: DispatchQueue(label: "com.valmayaki.mountjockey.network"))
@@ -289,7 +488,7 @@ final class SMBShareManager: NSObject, ObservableObject {
             repeats: true
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.mountAll()
+                self?.scheduleMountAll(reason: "Retry timer fired", delay: 0)
             }
         }
 
@@ -299,13 +498,34 @@ final class SMBShareManager: NSObject, ObservableObject {
     }
 
     @objc private func didWake() {
-        appendLog("Mac woke from sleep; checking configured shares.")
-        mountAll()
+        scheduleMountAll(reason: "Mac woke from sleep", delay: 10)
     }
 
     @objc private func volumeDidUnmount() {
         refreshMountStates()
-        mountAll()
+        scheduleMountAll(reason: "Volume unmounted", delay: 3)
+    }
+
+    private func scheduleMountAll(reason: String, delay: TimeInterval) {
+        scheduledMountAllTask?.cancel()
+        appendLog("\(reason); checking configured shares\(delay > 0 ? " after debounce." : ".")")
+        scheduledMountAllTask = Task { [weak self] in
+            guard delay > 0 else {
+                await MainActor.run {
+                    self?.mountAll()
+                    self?.scheduledMountAllTask = nil
+                }
+                return
+            }
+
+            let nanoseconds = UInt64(delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.mountAll()
+                self?.scheduledMountAllTask = nil
+            }
+        }
     }
 
     private func appendLog(_ message: String, level: LogLevel = .info) {

@@ -6,8 +6,10 @@ BUILD_DIR="${ROOT_DIR}/build"
 DERIVED_DATA="${BUILD_DIR}/DerivedData"
 APP_PATH="${DERIVED_DATA}/Build/Products/Release/MountJockey.app"
 ZIP_PATH="${BUILD_DIR}/MountJockey.zip"
+DMG_PATH="${BUILD_DIR}/MountJockey.dmg"
+DMG_STAGE="${BUILD_DIR}/dmg-stage"
 
-rm -rf "${DERIVED_DATA}" "${ZIP_PATH}"
+rm -rf "${DERIVED_DATA}" "${ZIP_PATH}" "${DMG_PATH}" "${DMG_STAGE}"
 mkdir -p "${BUILD_DIR}"
 
 xcodebuild \
@@ -28,4 +30,16 @@ ARCHITECTURES="$(lipo -archs "${APP_PATH}/Contents/MacOS/MountJockey")"
 [[ "${ARCHITECTURES}" == *arm64* && "${ARCHITECTURES}" == *x86_64* ]]
 
 ditto -c -k --keepParent "${APP_PATH}" "${ZIP_PATH}"
+mkdir -p "${DMG_STAGE}"
+ditto "${APP_PATH}" "${DMG_STAGE}/MountJockey.app"
+ln -s /Applications "${DMG_STAGE}/Applications"
+hdiutil create \
+  -volname "MountJockey" \
+  -srcfolder "${DMG_STAGE}" \
+  -ov \
+  -format UDZO \
+  "${DMG_PATH}"
+
+rm -rf "${DMG_STAGE}"
 echo "Built ${ZIP_PATH}"
+echo "Built ${DMG_PATH}"
