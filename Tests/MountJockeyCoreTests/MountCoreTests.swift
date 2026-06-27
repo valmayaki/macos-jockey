@@ -252,6 +252,13 @@ final class MountCoreTests: XCTestCase {
         XCTAssertEqual(MountJockeyError.mountFailed(12345).code, "SMB_MOUNT_STATUS_12345")
     }
 
+    func testSMBFSPasswordResponseUsesLineFeed() {
+        let response = SmbfsShareMounter.passwordPromptResponse(for: "secret")
+
+        XCTAssertEqual(response, Data("secret\n".utf8))
+        XCTAssertNotEqual(response, Data("secret\r".utf8))
+    }
+
     func testKeychainCredentialRoundTrip() throws {
         let store = KeychainCredentialStore()
         let share = ShareConfiguration(

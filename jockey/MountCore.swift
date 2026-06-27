@@ -829,6 +829,12 @@ struct NetFSShareMounter: ShareMounting {
 }
 
 struct SmbfsShareMounter: ShareMounting {
+    static func passwordPromptResponse(for password: String) -> Data {
+        var payload = Data(password.utf8)
+        payload.append(0x0a)
+        return payload
+    }
+
     func mount(_ share: ShareConfiguration, password: String) throws {
         let mountPoint = share.normalizedMountPoint
         try FileManager.default.createDirectory(atPath: mountPoint, withIntermediateDirectories: true)
@@ -981,8 +987,7 @@ struct SmbfsShareMounter: ShareMounting {
     }
 
     private func writePassword(_ password: String, to fd: Int32) throws {
-        var payload = Array(password.utf8)
-        payload.append(0x0d)
+        let payload = Self.passwordPromptResponse(for: password)
         let written = payload.withUnsafeBytes { bytes -> ssize_t in
             guard let base = bytes.baseAddress else { return -1 }
             return Darwin.write(fd, base, bytes.count)
