@@ -6,6 +6,11 @@ node_modules
 .bundle
 vendor
 
+## Local secrets and macOS metadata
+.env
+.DS_Store
+**/.DS_Store
+
 # Xcode
 #
 # gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
