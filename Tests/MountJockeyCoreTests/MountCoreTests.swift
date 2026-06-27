@@ -1,4 +1,5 @@
 import XCTest
+import Security
 @testable import MountJockeyCore
 
 final class MountCoreTests: XCTestCase {
@@ -259,6 +260,35 @@ final class MountCoreTests: XCTestCase {
         XCTAssertNotEqual(response, Data("secret\r".utf8))
     }
 
+
+    func testStablePasswordSaveDeletesAppOwnedLegacyCredentials() throws {
+        let store = KeychainCredentialStore()
+        let share = ShareConfiguration(
+            name: "Cleanup",
+            host: "cleanup-\(UUID().uuidString).example.test",
+            shareName: "data",
+            username: "tester",
+            mountPoint: "/tmp/cleanup",
+            isEnabled: true
+        )
+
+        defer { try? store.deletePassword(for: share) }
+        defer { share.legacyCredentialAccounts.forEach { deleteAppCredential(account: $0) } }
+
+        for account in share.legacyCredentialAccounts {
+            try addAppCredential(account: account, password: "old-password")
+            XCTAssertTrue(appCredentialExists(account: account))
+        }
+
+        try store.save(password: "new-password", for: share)
+
+        XCTAssertTrue(try store.containsPassword(for: share))
+        XCTAssertEqual(try store.password(for: share), "new-password")
+        for account in share.legacyCredentialAccounts {
+            XCTAssertFalse(appCredentialExists(account: account))
+        }
+    }
+
     func testKeychainCredentialRoundTrip() throws {
         let store = KeychainCredentialStore()
         let share = ShareConfiguration(
@@ -277,4 +307,42 @@ final class MountCoreTests: XCTestCase {
         XCTAssertTrue(try store.containsPassword(for: share))
         XCTAssertEqual(try store.password(for: share), "super-secret-password")
     }
+    private func addAppCredential(account: String, password: String) throws {
+        deleteAppCredential(account: account)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.valmayaki.mountjockey.smb",
+            kSecAttrAccount as String: account,
+            kSecValueData as String: Data(password.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+    }
+
+    private func deleteAppCredential(account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.valmayaki.mountjockey.smb",
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    private func appCredentialExists(account: String) -> Bool {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.valmayaki.mountjockey.smb",
+            kSecAttrAccount as String: account
+        ]
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return status == errSecSuccess && result != nil
+    }
+
 }

@@ -277,13 +277,30 @@ struct ShareConfiguration: Codable, Identifiable, Equatable, Sendable {
     }
 
     var credentialAccount: String {
-        let identity = [
+        let digest = SHA256.hash(data: Data(credentialPipeIdentity.utf8))
+        return "v2:" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    var credentialPipeIdentity: String {
+        [
             host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             shareName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         ].joined(separator: "|")
-        let digest = SHA256.hash(data: Data(identity.utf8))
-        return "v2:" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    var legacyCredentialAccounts: [String] {
+        [
+            id.uuidString,
+            host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            host.trimmingCharacters(in: .whitespacesAndNewlines)
+        ]
+        .filter { !$0.isEmpty && $0 != credentialAccount }
+        .reduce(into: [String]()) { result, account in
+            if !result.contains(account) {
+                result.append(account)
+            }
+        }
     }
 
     private static func standardizedPath(_ path: String) -> String {
@@ -540,14 +557,20 @@ final class KeychainCredentialStore: CredentialStoring, @unchecked Sendable {
     }
 
     private func queries(for share: ShareConfiguration) -> [String] {
-        let stable = share.credentialAccount
-        let legacy = share.id.uuidString
-        return stable == legacy ? [stable] : [stable, legacy]
+        [share.credentialAccount] + share.legacyCredentialAccounts
+    }
+
+    private func deleteLegacyPasswords(for share: ShareConfiguration) throws {
+        for account in share.legacyCredentialAccounts {
+            let status = SecItemDelete(query(for: account) as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+            }
+        }
     }
 
     func save(password: String, for share: ShareConfiguration) throws {
         let stableAccount = share.credentialAccount
-        let legacyAccount = share.id.uuidString
         var lookup = query(for: stableAccount)
         let attributes: [String: Any] = [
             kSecValueData as String: Data(password.utf8),
@@ -556,6 +579,7 @@ final class KeychainCredentialStore: CredentialStoring, @unchecked Sendable {
 
         let updateStatus = SecItemUpdate(lookup as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecSuccess {
+            try? deleteLegacyPasswords(for: share)
             return
         }
         guard updateStatus == errSecItemNotFound else {
@@ -568,20 +592,7 @@ final class KeychainCredentialStore: CredentialStoring, @unchecked Sendable {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(addStatus))
         }
 
-        if stableAccount != legacyAccount {
-            var legacyLookup = query(for: legacyAccount)
-            attributes.forEach { legacyLookup[$0.key] = $0.value }
-            let legacyStatus = SecItemUpdate(query(for: legacyAccount) as CFDictionary, attributes as CFDictionary)
-            if legacyStatus != errSecSuccess && legacyStatus != errSecItemNotFound {
-                throw NSError(domain: NSOSStatusErrorDomain, code: Int(legacyStatus))
-            }
-            if legacyStatus == errSecItemNotFound {
-                let addLegacyStatus = SecItemAdd(legacyLookup as CFDictionary, nil)
-                guard addLegacyStatus == errSecSuccess else {
-                    throw NSError(domain: NSOSStatusErrorDomain, code: Int(addLegacyStatus))
-                }
-            }
-        }
+        try? deleteLegacyPasswords(for: share)
 
         if !legacyService.isEmpty {
             let legacyIdentityQuery: [String: Any] = [
@@ -608,7 +619,9 @@ final class KeychainCredentialStore: CredentialStoring, @unchecked Sendable {
                 throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
             }
             let password = String(data: data, encoding: .utf8)
-            if account == share.id.uuidString, let password {
+            if account == share.credentialAccount {
+                try? deleteLegacyPasswords(for: share)
+            } else if let password {
                 try? save(password: password, for: share)
             }
             return password
